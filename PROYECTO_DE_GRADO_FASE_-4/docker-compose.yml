@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  aplicacion:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bienestar_aplicacion
+    restart: unless-stopped
+    working_dir: /var/www
+    volumes:
+      - ./backend:/var/www
+    networks:
+      - red_bienestar
+    environment:
+      - APP_ENV=local
+      - APP_DEBUG=true
+      - DB_HOST=base_datos
+      - DB_DATABASE=bienestar_incatec
+      - DB_USERNAME=usuario_bienestar
+      - DB_PASSWORD=contrasena_segura
+    depends_on:
+      - base_datos
+
+  servidor_web:
+    image: nginx:alpine
+    container_name: bienestar_servidor_web
+    restart: unless-stopped
+    ports:
+      - "8000:80"
+    volumes:
+      - ./backend:/var/www
+      - ./docker/nginx:/etc/nginx/conf.d
+    networks:
+      - red_bienestar
+    depends_on:
+      - aplicacion
+
+  base_datos:
+    image: mysql:8.0
+    container_name: bienestar_base_datos
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: bienestar_incatec
+      MYSQL_ROOT_PASSWORD: contrasena_root
+      MYSQL_PASSWORD: contrasena_segura
+      MYSQL_USER: usuario_bienestar
+    volumes:
+      - datos_mysql:/var/lib/mysql
+    networks:
+      - red_bienestar
+
+volumes:
+  datos_mysql:
+
+networks:
+  red_bienestar:
+    driver: bridge
