@@ -1,0 +1,609 @@
+1) Backend — Modelo Estudiante
+
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+
+class Estudiante extends Model
+{
+    protected $table = 'estudiantes';
+
+    protected $fillable = [
+        'codigo',
+        'nombre',
+        'correo_electronico',
+        'programa_academico',
+        'semestre_actual',
+        'promedio_academico',
+        'asistencia_porcentaje',
+        'nivel_estres',
+        'situacion_economica',
+        'puntaje_riesgo_total',
+        'nivel_riesgo',
+        'fecha_ultima_evaluacion',
+    ];
+
+    protected $casts = [
+        'promedio_academico' => 'decimal:2',
+        'asistencia_porcentaje' => 'decimal:2',
+        'nivel_estres' => 'integer',
+        'situacion_economica' => 'integer',
+        'puntaje_riesgo_total' => 'decimal:2',
+        'fecha_ultima_evaluacion' => 'datetime',
+    ];
+
+    public function evaluacionesRiesgo()
+    {
+        return $this->hasMany(EvaluacionRiesgo::class, 'estudiante_id');
+    }
+
+    public function alertas()
+    {
+        return $this->hasMany(Alerta::class, 'estudiante_id');
+    }
+
+    public function calcularPuntajeRiesgo(): float
+    {
+        $pesos = [
+            'academico' => 0.40,
+            'emocional' => 0.35,
+            'economico' => 0.25,
+        ];
+
+        $puntajeAcademico = $this->calcularRiesgoAcademico();
+        $puntajeEmocional = $this->calcularRiesgoEmocional();
+        $puntajeEconomico = $this->calcularRiesgoEconomico();
+
+        $this->puntaje_riesgo_total = round(
+            $puntajeAcademico * $pesos['academico'] +
+            $puntajeEmocional * $pesos['emocional'] +
+            $puntajeEconomico * $pesos['economico'],
+            2
+        );
+
+        $this->nivel_riesgo = $this->determinarNivelRiesgo($this->puntaje_riesgo_total);
+        $this->fecha_ultima_evaluacion = now();
+
+        $this->save();
+
+        return (float) $this->puntaje_riesgo_total;
+    }
+
+    private function calcularRiesgoAcademico(): float
+    {
+        $puntaje = 0;
+
+        if ($this->promedio_academico < 3.0) $puntaje += 8;
+        elseif ($this->promedio_academico < 3.5) $puntaje += 5;
+
+        if ($this->asistencia_porcentaje < 70) $puntaje += 7;
+        elseif ($this->asistencia_porcentaje < 80) $puntaje += 4;
+
+        return min($puntaje, 10);
+    }
+
+    private function calcularRiesgoEmocional(): float
+    {
+        return (float) $this->nivel_estres; // escala 1-10
+    }
+
+    private function calcularRiesgoEconomico(): float
+    {
+        return (float) $this->situacion_economica; // escala 1-10
+    }
+
+    private function determinarNivelRiesgo(float $puntaje): string
+    {
+        if ($puntaje >= 7.5) return 'alto';
+        if ($puntaje >= 5.0) return 'medio';
+        return 'bajo';
+    }
+
+    public function generarAlertaSiEsNecesario(): void
+    {
+        if ($this->nivel_riesgo === 'alto') {
+            Alerta::create([
+                'estudiante_id' => $this->id,
+                'tipo' => 'riesgo_alto',
+                'mensaje' => 'Estudiante identificado con alto riesgo de deserción',
+                'prioridad' => 'alta',
+                'estado' => 'activa'
+            ]);
+        }
+    }
+}
+
+2) Controlador DashboardController
+
+
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Estudiante;
+use App\Models\Alerta;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Exception;
+use Illuminate\Support\Facades\Log;
+
+class DashboardController extends Controller
+{
+    public function obtenerDatosTiempoReal(): JsonResponse
+    {
+        $datosDashboard = [
+            'metricas' => [
+                'total_estudiantes' => Estudiante::count(),
+                'estudiantes_alto_riesgo' => Estudiante::where('nivel_riesgo', 'alto')->count(),
+                'estudiantes_medio_riesgo' => Estudiante::where('nivel_riesgo', 'medio')->count(),
+                'alertas_activas' => Alerta::where('estado', 'activa')->count(),
+                'intervenciones_hoy' => Alerta::whereDate('created_at', today())
+                    ->where('estado', 'resuelta')
+                    ->count()
+            ],
+            'alertas_recientes' => Alerta::with('estudiante')
+                ->where('estado', 'activa')
+                ->orderBy('created_at', 'desc')
+                ->limit(10)
+                ->get()
+                ->map(function ($alerta) {
+                    return [
+                        'id' => $alerta->id,
+                        'mensaje' => $alerta->mensaje,
+                        'prioridad' => $alerta->prioridad,
+                        'estudiante' => [
+                            'id' => $alerta->estudiante->id,
+                            'nombre' => $alerta->estudiante->nombre,
+                            'programa' => $alerta->estudiante->programa_academico
+                        ],
+                        'fecha_creacion' => $alerta->created_at->toIsoString()
+                    ];
+                }),
+            'tendencias_riesgo' => $this->obtenerTendenciasRiesgo(),
+            'ultima_actualizacion' => now()->toIsoString()
+        ];
+
+        return response()->json($datosDashboard);
+    }
+
+    public function evaluarRiesgoEstudiante(Request $request, int $estudianteId): JsonResponse
+    {
+        $validado = $request->validate([
+            'datos_academicos.promedio' => 'required|numeric',
+            'datos_academicos.asistencia' => 'required|numeric',
+            'datos_emocionales.nivel_estres' => 'required|integer',
+            'datos_economicos.situacion_economica' => 'required|integer'
+        ]);
+
+        try {
+            $estudiante = Estudiante::findOrFail($estudianteId);
+
+            $estudiante->update([
+                'promedio_academico' => $validado['datos_academicos']['promedio'],
+                'asistencia_porcentaje' => $validado['datos_academicos']['asistencia'],
+                'nivel_estres' => $validado['datos_emocionales']['nivel_estres'],
+                'situacion_economica' => $validado['datos_economicos']['situacion_economica']
+            ]);
+
+            $puntajeRiesgo = $estudiante->calcularPuntajeRiesgo();
+            $estudiante->generarAlertaSiEsNecesario();
+
+            return response()->json([
+                'exito' => true,
+                'estudiante' => $estudiante->nombre,
+                'puntaje_riesgo' => $puntajeRiesgo,
+                'nivel_riesgo' => $estudiante->nivel_riesgo,
+                'recomendaciones' => $this->generarRecomendaciones($estudiante->nivel_riesgo)
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('Error evaluando riesgo estudiante: ' . $e->getMessage());
+
+            return response()->json([
+                'exito' => false,
+                'error' => 'Error en el proceso de evaluación'
+            ], 500);
+        }
+    }
+
+    private function obtenerTendenciasRiesgo(): array
+    {
+        return [
+            'riesgo_alto_ultima_semana' => Estudiante::where('nivel_riesgo', 'alto')
+                ->whereDate('fecha_ultima_evaluacion', '>=', now()->subWeek())
+                ->count(),
+            'tendencia_semanal' => 'estable' // placeholder, se puede calcular con histórico
+        ];
+    }
+
+    private function generarRecomendaciones(string $nivelRiesgo): array
+    {
+        if ($nivelRiesgo === 'alto') {
+            return [
+                'Intervención inmediata requerida',
+                'Contactar al estudiante en máximo 24 horas',
+                'Coordinar cita con bienestar institucional',
+                'Evaluar apoyo económico si aplica'
+            ];
+        } elseif ($nivelRiesgo === 'medio') {
+            return [
+                'Seguimiento quincenal',
+                'Monitorear asistencia académica',
+                'Ofrecer tutorías académicas'
+            ];
+        } else {
+            return [
+                'Seguimiento mensual rutinario',
+                'Mantener comunicación abierta'
+            ];
+        }
+    }
+}
+
+
+
+3) Frontend — PanelPrincipal.jsx (React + MUI corregido)
+
+Ruta sugerida: frontend/src/componentes/Dashboard/PanelPrincipal.jsx
+
+import React, { useState, useEffect } from 'react';
+import {
+  Box,
+  Grid,
+  Card,
+  CardContent,
+  Typography,
+  Button,
+  Alert,
+  CircularProgress
+} from '@mui/material';
+import PeopleIcon from '@mui/icons-material/People';
+import WarningIcon from '@mui/icons-material/Warning';
+import TrendingUpIcon from '@mui/icons-material/TrendingUp';
+import NotificationsActiveIcon from '@mui/icons-material/NotificationsActive';
+import RefreshIcon from '@mui/icons-material/Refresh';
+import ServicioAPI from '../../servicios/apiEstudiantes';
+
+const TarjetaMetrica = ({ icono, titulo, valor, subtitulo }) => (
+  <Card sx={{ height: '100%' }}>
+    <CardContent>
+      <Box display="flex" alignItems="center" mb={2}>
+        {icono}
+        <Typography variant="h6" sx={{ ml: 1 }}>
+          {titulo}
+        </Typography>
+      </Box>
+      <Typography variant="h4" gutterBottom>
+        {valor === null ? <CircularProgress size={24} /> : valor}
+      </Typography>
+      {subtitulo && (
+        <Typography variant="body2" color="text.secondary">
+          {subtitulo}
+        </Typography>
+      )}
+    </CardContent>
+  </Card>
+);
+
+const PanelPrincipal = () => {
+  const [datosDashboard, setDatosDashboard] = useState(null);
+  const [cargando, setCargando] = useState(true);
+  const [ultimaActualizacion, setUltimaActualizacion] = useState(null);
+
+  useEffect(() => {
+    obtenerDatosDashboard();
+    const intervalo = setInterval(obtenerDatosDashboard, 30000);
+    return () => clearInterval(intervalo);
+  }, []);
+
+  const obtenerDatosDashboard = async () => {
+    setCargando(true);
+    try {
+      const data = await ServicioAPI.obtenerDashboardTiempoReal();
+      setDatosDashboard(data);
+      setUltimaActualizacion(data.ultima_actualizacion || new Date().toISOString());
+    } catch (err) {
+      console.error('Error obteniendo datos del dashboard:', err);
+    } finally {
+      setCargando(false);
+    }
+  };
+
+  const manejarIntervencionInmediata = async (estudianteId) => {
+    try {
+      await ServicioAPI.registrarIntervencion({
+        estudiante_id: estudianteId,
+        tipo: 'inmediata',
+        observaciones: 'Intervención iniciada desde dashboard'
+      });
+      obtenerDatosDashboard();
+    } catch (error) {
+      console.error('Error registrando intervención:', error);
+    }
+  };
+
+  return (
+    <Box p={3}>
+      <Box display="flex" justifyContent="space-between" alignItems="center" mb={4}>
+        <Typography variant="h4" component="h1">
+          Panel de Control - Bienestar Estudiantil
+        </Typography>
+        <Box display="flex" alignItems="center" gap={2}>
+          <Typography variant="body2" color="text.secondary">
+            {ultimaActualizacion && `Última actualización: ${new Date(ultimaActualizacion).toLocaleTimeString()}`}
+          </Typography>
+          <Button startIcon={<RefreshIcon />} onClick={obtenerDatosDashboard} disabled={cargando} variant="outlined">
+            {cargando ? 'Actualizando...' : 'Actualizar'}
+          </Button>
+        </Box>
+      </Box>
+
+      <Grid container spacing={3} mb={4}>
+        <Grid item xs={12} sm={6} md={3}>
+          <TarjetaMetrica
+            icono={<PeopleIcon />}
+            titulo="Total Estudiantes"
+            valor={datosDashboard?.metricas?.total_estudiantes ?? null}
+          />
+        </Grid>
+        <Grid item xs={12} sm={6} md={3}>
+          <TarjetaMetrica
+            icono={<WarningIcon />}
+            titulo="Alto Riesgo"
+            valor={datosDashboard?.metricas?.estudiantes_alto_riesgo ?? null}
+            subtitulo="Requieren intervención inmediata"
+          />
+        </Grid>
+        <Grid item xs={12} sm={6} md={3}>
+          <TarjetaMetrica
+            icono={<TrendingUpIcon />}
+            titulo="Riesgo Medio"
+            valor={datosDashboard?.metricas?.estudiantes_medio_riesgo ?? null}
+            subtitulo="Seguimiento cercano"
+          />
+        </Grid>
+        <Grid item xs={12} sm={6} md={3}>
+          <TarjetaMetrica
+            icono={<NotificationsActiveIcon />}
+            titulo="Alertas Activas"
+            valor={datosDashboard?.metricas?.alertas_activas ?? null}
+            subtitulo="Intervenciones pendientes"
+          />
+        </Grid>
+      </Grid>
+
+      <Card>
+        <CardContent>
+          <Typography variant="h5" gutterBottom>
+            Alertas Recientes
+          </Typography>
+
+          {(!datosDashboard || datosDashboard.alertas_recientes?.length === 0) ? (
+            <Alert severity="success">No hay alertas activas en este momento</Alert>
+          ) : (
+            datosDashboard.alertas_recientes.map((alerta) => (
+              <Alert
+                key={alerta.id}
+                severity={alerta.prioridad === 'alta' ? 'error' : 'warning'}
+                action={
+                  <Button color="inherit" size="small" onClick={() => manejarIntervencionInmediata(alerta.estudiante.id)}>
+                    INTERVENIR
+                  </Button>
+                }
+                sx={{ mb: 1 }}
+              >
+                <strong>{alerta.estudiante.nombre}</strong> - {alerta.mensaje}
+                <Typography variant="body2" component="div">
+                  Programa: {alerta.estudiante.programa}
+                </Typography>
+              </Alert>
+            ))
+          )}
+        </CardContent>
+      </Card>
+    </Box>
+  );
+};
+
+export default PanelPrincipal;
+
+4) Servicio API - apiEstudiantes.js (corregido)
+
+Ruta: frontend/src/servicios/apiEstudiantes.js
+
+class ServicioAPI {
+  constructor() {
+    this.urlBase = process.env.REACT_APP_API_URL || 'http://localhost:8000/api';
+  }
+
+  async obtenerDashboardTiempoReal() {
+    const respuesta = await fetch(`${this.urlBase}/dashboard/tiempo-real`);
+    if (!respuesta.ok) {
+      const text = await respuesta.text();
+      throw new Error('Error obteniendo datos del dashboard: ' + text);
+    }
+    return await respuesta.json();
+  }
+
+  async registrarIntervencion(datosIntervencion) {
+    const respuesta = await fetch(`${this.urlBase}/intervenciones`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(datosIntervencion)
+    });
+
+    if (!respuesta.ok) {
+      const text = await respuesta.text();
+      throw new Error('Error registrando intervención: ' + text);
+    }
+
+    return await respuesta.json();
+  }
+
+  async evaluarRiesgoEstudiante(estudianteId, datosEvaluacion) {
+    const respuesta = await fetch(`${this.urlBase}/estudiantes/${estudianteId}/evaluar-riesgo`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(datosEvaluacion)
+    });
+
+    if (!respuesta.ok) {
+      const text = await respuesta.text();
+      throw new Error('Error evaluando riesgo del estudiante: ' + text);
+    }
+
+    return await respuesta.json();
+  }
+}
+
+export default new ServicioAPI();
+
+5) docker-compose.yml (ajustes mínimos realistas)
+
+Ruta: docker-compose.yml
+
+version: '3.8'
+
+services:
+  aplicacion:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bienestar_aplicacion
+    restart: unless-stopped
+    working_dir: /var/www
+    volumes:
+      - ./backend:/var/www
+    networks:
+      - red_bienestar
+    environment:
+      - APP_ENV=local
+      - APP_DEBUG=true
+      - DB_HOST=base_datos
+      - DB_DATABASE=bienestar_incatec
+      - DB_USERNAME=usuario_bienestar
+      - DB_PASSWORD=contrasena_segura
+
+  servidor_web:
+    image: nginx:alpine
+    container_name: bienestar_servidor_web
+    restart: unless-stopped
+    ports:
+      - "8000:80"
+    volumes:
+      - ./backend:/var/www
+      - ./docker/nginx:/etc/nginx/conf.d
+    networks:
+      - red_bienestar
+    depends_on:
+      - aplicacion
+
+  base_datos:
+    image: mysql:8.0
+    container_name: bienestar_base_datos
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: bienestar_incatec
+      MYSQL_ROOT_PASSWORD: contrasena_root
+      MYSQL_PASSWORD: contrasena_segura
+      MYSQL_USER: usuario_bienestar
+    volumes:
+      - datos_mysql:/var/lib/mysql
+    networks:
+      - red_bienestar
+
+volumes:
+  datos_mysql:
+
+networks:
+  red_bienestar:
+    driver: bridge
+
+
+
+6) Script Python prediccion_riesgo.py 
+
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+import joblib
+
+class PredictorRiesgoDesercion:
+    def __init__(self):
+        self.modelo = None
+        self.caracteristicas = [
+            'rendimiento_academico',
+            'porcentaje_asistencia',
+            'nivel_estres',
+            'situacion_economica',
+            'apoyo_familiar',
+            'habitos_estudio'
+        ]
+
+    def preparar_datos(self, dataframe: pd.DataFrame):
+        X = dataframe[self.caracteristicas]
+        y = dataframe['riesgo_desercion']
+        return X, y
+
+    def entrenar_modelo(self, X, y):
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+
+        self.modelo = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=10,
+            random_state=42
+        )
+
+        self.modelo.fit(X_train, y_train)
+
+        precision = self.modelo.score(X_test, y_test)
+        print(f"Precisión del modelo: {precision:.2%}")
+        return precision
+
+    def predecir_riesgo_estudiante(self, datos_estudiante: pd.DataFrame):
+        if self.modelo is None:
+            raise ValueError("El modelo debe ser entrenado o cargado primero")
+
+        probabilidades = self.modelo.predict_proba(datos_estudiante)
+        nivel_riesgo_idx = np.argmax(probabilidades, axis=1)[0]
+        confianza = np.max(probabilidades, axis=1)[0]
+
+        return {
+            'nivel_riesgo_idx': int(nivel_riesgo_idx),
+            'confianza': float(confianza),
+            'probabilidades': probabilidades[0].tolist()
+        }
+
+    def guardar_modelo(self, ruta_archivo: str):
+        joblib.dump(self.modelo, ruta_archivo)
+
+    def cargar_modelo(self, ruta_archivo: str):
+        self.modelo = joblib.load(ruta_archivo)
+
+
+if __name__ == "__main__":
+    datos_ejemplo = {
+        'rendimiento_academico': [8.5, 6.2, 9.1, 5.8, 7.3],
+        'porcentaje_asistencia': [0.95, 0.75, 0.98, 0.65, 0.85],
+        'nivel_estres': [2, 4, 1, 5, 3],
+        'situacion_economica': [3, 2, 4, 1, 3],
+        'apoyo_familiar': [4, 2, 5, 1, 3],
+        'habitos_estudio': [4, 2, 5, 1, 3],
+        'riesgo_desercion': [0, 1, 0, 1, 0]
+    }
+
+    df = pd.DataFrame(datos_ejemplo)
+    predictor = PredictorRiesgoDesercion()
+    X, y = predictor.preparar_datos(df)
+    predictor.entrenar_modelo(X, y)
